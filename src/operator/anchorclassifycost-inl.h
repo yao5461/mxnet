@@ -16,6 +16,9 @@
 #include <string>
 #include <utility>
 #include "./operator_common.h"
+#include "./mshadow_op.h"
+
+#define MIN_NUM 1e-37f
 
 namespace mxnet {
 namespace op {
@@ -45,27 +48,30 @@ class AnchorClsCostOp : public Operator {
     this->param_ = p;
   }
 
-
   virtual void Forward(const OpContext &ctx,
                        const std::vector<TBlob> &in_data,
                        const std::vector<OpReqType> &req,
                        const std::vector<TBlob> &out_data,
                        const std::vector<TBlob> &aux_args) {
-
     using namespace mshadow;
     using namespace mshadow::expr;
     Stream<xpu> *s = ctx.get_stream<xpu>();
-
+    
     TBlob data_in = in_data[anchorclscost_enum::kData];
     TBlob label = in_data[anchorclscost_enum::kLabel];
     TBlob marklabel = in_data[anchorclscost_enum::kMarkLabel];
     TBlob data_out = out_data[anchorclscost_enum::kOut];
 
-    Tensor<xpu, 4> tdata = data_in.get<xpu, 4, real_t>(s);
-    Tensor<xpu, 4> tlabel = label.get<xpu, 4, real_t>(s);
-    Tensor<xpu, 4> tmarklabel = marklabel.get<xpu, 4, real_t>(s);
-    Tensor<xpu, 4> data_out = data_out.get<xpu, 4, real_t>(s);
+    Tensor<xpu, 2> tdata_in = data_in.FlatTo2D<xpu, real_t>(s);
+    Tensor<xpu, 2> tlabel = label.FlatTo2D<xpu, real_t>(s);
+    Tensor<xpu, 2> tmarklabel = marklabel.FlatTo2D<xpu, real_t>(s);
+    Tensor<xpu, 2> tdata_out = data_out.FlatTo2D<xpu, real_t>(s);
     
+//    std::cout << "class:" << tdata_in[0][0] << "\n";
+
+    tdata_out = F<mshadow_op::log>(tdata_in + MIN_NUM) * tlabel +
+                (1.0f - tlabel) * F<mshadow_op::log>(1.0f - tdata_in + MIN_NUM);
+    tdata_out = tdata_out * tmarklabel * -1;
   }
 
   virtual void Backward(const OpContext &ctx,
@@ -76,9 +82,22 @@ class AnchorClsCostOp : public Operator {
                        const std::vector<TBlob> &in_grad,
                        const std::vector<TBlob> &aux_args) {
     using namespace mshadow;
+    using namespace mshadow::expr;
     Stream<xpu> *s = ctx.get_stream<xpu>();
+
+    TBlob data_in = in_data[anchorclscost_enum::kData];
+    TBlob label = in_data[anchorclscost_enum::kLabel];
+    TBlob marklabel = in_data[anchorclscost_enum::kMarkLabel];
+    TBlob grad_in = in_grad[anchorclscost_enum::kOut];
+
+    Tensor<xpu, 2> tdata_in = data_in.FlatTo2D<xpu, real_t>(s);
+    Tensor<xpu, 2> tlabel = label.FlatTo2D<xpu, real_t>(s);
+    Tensor<xpu, 2> tmarklabel = marklabel.FlatTo2D<xpu, real_t>(s);
+    Tensor<xpu, 2> tgrad_in = grad_in.FlatTo2D<xpu, real_t>(s);
     
-    
+    tgrad_in = tlabel / (tdata_in + MIN_NUM) - \
+              (1.0f - tlabel) / (1.0f - tdata_in + MIN_NUM);
+    tgrad_in = tgrad_in * tmarklabel * -1;
   }
 
   AnchorClsCostParam param_;

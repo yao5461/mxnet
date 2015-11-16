@@ -28,5 +28,6 @@ MXNET_REGISTER_OP_PROPERTY(AnchorClsCost, AnchorClsCostProp)
 .add_argument("marklabel", "Symbol", "MarkLabel data to the AnchorClsCostOp.")
 .add_arguments(AnchorClsCostParam::__FIELDS__())
 .describe("Apply AnchorClsCost to input.");
+
 }  // namespace op
 }  // namespace mxnet
