@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <utility>
 #include <vector>
+#include <map>
 
 namespace mxnet {
 /*!
@@ -109,23 +110,24 @@ class StaticGraph {
      *  When the node is a Backward node, the op field will be nullptr
      */
     int32_t backward_source_id;
+    /*! \brief additional attributes about the node */
+    std::map<std::string, std::string> attr;
     /*! \brief default constructor */
     Node() : backward_source_id(-1) {}
-
-    friend void swap(Node& lhs, Node& rhs) {
-      std::swap(lhs.op, rhs.op);
-      std::swap(lhs.name, rhs.name);
-      std::swap(lhs.inputs, rhs.inputs);
-      std::swap(lhs.backward_source_id, rhs.backward_source_id);
-    }
     /*! \brief copy constructor in favor of serialization. */
-    Node(const Node& another) : op(another.op.get() ? another.op.get()->Copy() : nullptr),
-                                name(another.name),
-                                inputs(another.inputs),
-                                backward_source_id(another.backward_source_id) {}
+    Node(const Node& another)
+        : op(another.op.get() ? another.op.get()->Copy() : nullptr),
+          name(another.name),
+          inputs(another.inputs),
+          backward_source_id(another.backward_source_id),
+          attr(another.attr) {}
 
     inline Node& operator=(Node another) {
-      swap(*this, another);
+      op = std::move(another.op);
+      name = std::move(another.name);
+      inputs = std::move(another.inputs);
+      backward_source_id = std::move(another.backward_source_id);
+      attr = std::move(another.attr);
       return *this;
     }
     /*! \return whether the node is forward op node */
@@ -174,6 +176,16 @@ class StaticGraph {
    */
   std::vector<uint32_t> TopoSort() const;
   /*!
+   * \brief Get a post DFS order traversal order from the head nodes.
+   *  Post DFS order is a special case of Topological order.
+   * \param heads The head of the node.
+   * \param banned The banned map, used to ban some nodes from the graph.
+   * \return a post DFS visit order of nodes that can reach heads.
+   */
+  std::vector<uint32_t> PostDFSOrder(const std::vector<uint32_t>& head_nodes,
+                                     const std::unordered_set<uint32_t>& banned
+                                     = std::unordered_set<uint32_t>()) const;
+  /*!
    * \brief infer the node shapes in the computation graph.
    *
    *  When calling this function, user can setup the shape information known into right position.
@@ -217,9 +229,11 @@ class StaticGraph {
    *
    * \param head_grad_nodes used to store the created head gradient inputs for backward pass.
    * \param arg_grads used to store gradients to args, can be multiple one if an argument is used by operator
+   * \param out_mirror_map The mirror map of the backward plan.
    */
   void MakeBackwardPass(std::vector<uint32_t> *head_grad_nodes,
-                        std::vector<DataEntry> *arg_grads);
+                        std::vector<DataEntry> *arg_grads,
+                        std::map<uint32_t, uint32_t>* out_mirror_map);
   /*!
    * \brief Convert symbol into static graph.
    * \param symbol the symbol to convert from.
@@ -233,6 +247,12 @@ class StaticGraph {
    * \return a created ElementWiseSum node
    */
   static Node CreateSumNode(const std::vector<DataEntry> &grad_source);
+  /*!
+   * \brief create a copy node.
+   * \param source the Source data
+   * \return a created _CrossDeviceCopy node
+   */
+  static Node CreateCopyNode(const DataEntry& source);
 };
 }  // namespace mxnet
 

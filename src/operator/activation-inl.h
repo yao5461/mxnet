@@ -24,7 +24,7 @@ namespace op {
 namespace activation {
 enum ActivationOpInputs {kData};
 enum ActivationOpOutputs {kOut};
-enum ActivationOpType {kReLU, kSigmoid, kTanh};
+enum ActivationOpType {kReLU, kSigmoid, kTanh, kSoftReLU};
 }  // activation
 
 struct ActivationParam : public dmlc::Parameter<ActivationParam> {
@@ -35,6 +35,7 @@ struct ActivationParam : public dmlc::Parameter<ActivationParam> {
     .add_enum("relu", activation::kReLU)
     .add_enum("sigmoid", activation::kSigmoid)
     .add_enum("tanh", activation::kTanh)
+    .add_enum("softrelu", activation::kSoftReLU)
     .describe("Activation function to be applied.");
   }
 };
@@ -59,6 +60,10 @@ class ActivationOp : public Operator {
     Tensor<xpu, 2> data = in_data[activation::kData].FlatTo2D<xpu, real_t>(s);
     Tensor<xpu, 2> out = out_data[activation::kOut].FlatTo2D<xpu, real_t>(s);
     Assign(out, req[activation::kOut], F<ForwardOp>(data));
+    // Use asynchronize complete notification
+    // This is only intended as an example of async ops
+    if (s != NULL) s->Wait();
+    ctx.async_on_complete();
   }
 
   virtual void Backward(const OpContext &ctx,
@@ -74,33 +79,20 @@ class ActivationOp : public Operator {
     CHECK(in_data.size() == 1 && in_grad.size() == 1);
     CHECK_EQ(req.size(), 1);
     Stream<xpu> *s = ctx.get_stream<xpu>();
-    
-#if 0
-    Tensor<xpu, 4> grad = out_grad[activation::kOut].get<xpu, 4, real_t>(s);
-    TShape gshape = out_grad[activation::kOut].shape_;
-    if (0 || gshape[1] == 4 && gshape[2] == 43) {
-    std::cout << "active_out_grad => " << gshape[0] << ", " << gshape[1] << ", " << gshape[2] << ", " << gshape[3] << " ==> \n";
-    Tensor<xpu, 3> gradone = grad[0];
-//    for (index_t ddi = 0; ddi < gshape[1]; ddi++) {
-    for (index_t ddi = 0; ddi < 1; ddi++) {
-    std::cout << "ddi:" << ddi << "--->";
-    for (index_t ri = 0; ri < gshape[2]; ri++) {
-      for (index_t ci = 0; ci < gshape[3]; ci++) {
-        real_t tmpval = gradone[ddi][ri][ci];
-        if (fabs(tmpval) > 0.f) {
-          std::cout << tmpval << ", ";
-        }
-      }
-    }
-    std::cout << "\n";
-    }
-    }
-#endif
-
     Tensor<xpu, 2> m_out_grad = out_grad[activation::kOut].FlatTo2D<xpu, real_t>(s);
     Tensor<xpu, 2> m_out_data = out_data[activation::kOut].FlatTo2D<xpu, real_t>(s);
     Tensor<xpu, 2> m_in_grad = in_grad[activation::kData].FlatTo2D<xpu, real_t>(s);
     Assign(m_in_grad, req[activation::kData], F<BackwardOp>(m_out_data) * m_out_grad);
+    // Use asynchronize complete notification
+    // This is only intended as an example of async ops
+    if (s != NULL) s->Wait();
+    ctx.async_on_complete();
+  }
+
+  virtual ExecType exec_type() const {
+    // Use asynchronize complete notification
+    // This is only intended as an example of async ops
+    return kAsync;
   }
 };  // class ActivationOp
 

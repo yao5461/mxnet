@@ -7,17 +7,22 @@ ifndef MIN
 	export MIN= 0
 endif
 
+ifndef ANDROID
+        export ANDROID=0
+endif
+
+
 .PHONY: all clean
 
-CFLAGS=-std=c++11 -Wno-unknown-pragmas -Wall
-LDFLAGS=-lrt
 
+CFLAGS=-std=c++11 -Wno-unknown-pragmas -Wall
 ifneq ($(MIN), 1)
 	CFLAGS+= -I${OPENBLAS_ROOT}
 	LDFLAGS+=-L${OPENBLAS_ROOT} -lopenblas
 endif
 
-all: libmxnet_predict.a ${MXNET_ROOT}/lib/libmxnet_predict.so
+
+all: android libmxnet_predict.a ${MXNET_ROOT}/lib/libmxnet_predict.so
 
 mxnet_predict0.d: mxnet_predict0.cc
 	${CXX} ${CFLAGS} -MD -MF $@ \
@@ -34,6 +39,25 @@ mxnet_predict-all.o: mxnet_predict-all.cc
 
 libmxnet_predict.a: mxnet_predict-all.o
 	ar rcs libmxnet_predict.a $+
+
+jni_libmxnet_predict.o: mxnet_predict-all.cc
+	${CXX} ${CFLAGS} -fPIC -o $@ -c jni/predictor.cc
+
+jni_libmxnet_predict.so: jni_libmxnet_predict.o
+	${CXX} ${CFLAGS} -shared -o $@ $(filter %.o %.a, $^) $(LDFLAGS)
+
+ifneq ($(ANDROID), 1)
+        LDFLAGS+= -lrt
+        android:
+else
+        CFLAGS+=  -mhard-float -D_NDK_MATH_NO_SOFTFP=1 -O3
+        LDFLAGS+=  -Wl,--no-warn-mismatch -lm_hard
+        android: jni_libmxnet_predict.so
+endif
+
+libmxnet_predict.js: mxnet_predict-all.cc
+	emcc -std=c++11 -O2 -D__MXNET_JS__  -o $@ $+ -s EXPORTED_FUNCTIONS="['_MXPredCreate', '_MXPredGetOutputShape', '_MXPredSetInput', '_MXPredForward', '_MXPredPartialForward', '_MXPredGetOutput', '_MXPredFree', '_MXNDListCreate', '_MXNDListGet', '_MXNDListFree']" -s ALLOW_MEMORY_GROWTH=1
+
 
 ${MXNET_ROOT}/lib/libmxnet_predict.so:  mxnet_predict-all.o
 	@mkdir -p ${MXNET_ROOT}/lib

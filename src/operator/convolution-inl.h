@@ -30,6 +30,7 @@ enum ConvolutionOpResource {kTempSpace};
 struct ConvolutionParam : public dmlc::Parameter<ConvolutionParam> {
   TShape kernel;
   TShape stride;
+  TShape dilate;
   TShape pad;
   uint32_t num_filter;
   uint32_t num_group;
@@ -40,6 +41,8 @@ struct ConvolutionParam : public dmlc::Parameter<ConvolutionParam> {
     DMLC_DECLARE_FIELD(kernel).describe("convolution kernel size: (y, x)");
     DMLC_DECLARE_FIELD(stride).set_default(TShape(shape, shape + 2))
     .describe("convolution stride: (y, x)");
+    DMLC_DECLARE_FIELD(dilate).set_default(TShape(shape, shape + 2))
+    .describe("convolution dilate: (y, x)");
     shape[0] = shape[1] = 0;
     DMLC_DECLARE_FIELD(pad).set_default(TShape(shape, shape + 2))
     .describe("pad for convolution: (y, x)");
@@ -50,7 +53,7 @@ struct ConvolutionParam : public dmlc::Parameter<ConvolutionParam> {
               "This option is not supported by CuDNN, you can use SliceChannel to num_group,"
               "apply convolution and concat instead to achieve the same need.");
     DMLC_DECLARE_FIELD(workspace).set_default(512).set_range(128, 4096)
-    .describe("Tmp workspace for convolution (MB)");
+    .describe("Tmp workspace for convolution (MB).");
     DMLC_DECLARE_FIELD(no_bias).set_default(false)
     .describe("Whether to disable bias parameter.");
   }
@@ -61,7 +64,7 @@ class ConvolutionOp : public Operator {
  public:
   explicit ConvolutionOp(ConvolutionParam p) {
     this->param_ = p;
-    // convert MB to words
+    // convert MBytes first to Bytes and then to elements.
     param_.workspace = (param_.workspace << 20) / sizeof(real_t);
   }
 
@@ -105,14 +108,18 @@ class ConvolutionOp : public Operator {
                                     param_.kernel[0],
                                     param_.kernel[1],
                                     param_.stride[0],
-                                    param_.stride[1]);
+                                    param_.stride[1],
+                                    param_.dilate[0],
+                                    param_.dilate[1]);
       } else {
         temp_col = unpack_patch2col(pad(data.Slice(i, i + step),
                                         param_.pad[0], param_.pad[1]),
                                     param_.kernel[0],
                                     param_.kernel[1],
                                     param_.stride[0],
-                                    param_.stride[1]);
+                                    param_.stride[1],
+                                    param_.dilate[0],
+                                    param_.dilate[1]);
       }
       const index_t gstride = temp_col.size(0) / param_.num_group;
       for (uint32_t gid = 0; gid < param_.num_group; ++gid) {
@@ -157,26 +164,6 @@ class ConvolutionOp : public Operator {
                data.shape_[1] / param_.num_group * param_.kernel[0] * param_.kernel[1]);
     Tensor<xpu, 3> wmat = in_data[conv::kWeight].get_with_shape<xpu, 3, real_t>(wmat_shape, s);
     Tensor<xpu, 4> grad = out_grad[conv::kOut].get<xpu, 4, real_t>(s);
-#if 0
-    TShape gshape = out_grad[conv::kOut].shape_;
-    if (0 || gshape[1] == 1 && gshape[2] == 43) {
-    std::cout << "out_grad => " << gshape[0] << ", " << gshape[1] << ", " << gshape[2] << ", " << gshape[3] << " ==> \n";
-    Tensor<xpu, 3> gradone = grad[0];
-//    for (index_t ddi = 0; ddi < gshape[1]; ddi++) {
-    for (index_t ddi = 0; ddi < 1; ddi++) {
-    std::cout << "ddi:" << ddi << "--->";
-    for (index_t ri = 0; ri < gshape[2]; ri++) {
-      for (index_t ci = 0; ci < gshape[3]; ci++) {
-        real_t tmpval = gradone[ddi][ri][ci];
-        if (1 || fabs(tmpval) > 0.f) {
-          std::cout << tmpval << ", ";
-        }
-      }
-    }
-    std::cout << "\n";
-    }
-    }
-#endif
     Tensor<xpu, 4> gdata = in_grad[conv::kData].get<xpu, 4, real_t>(s);
     Tensor<xpu, 3> gwmat = in_grad[conv::kWeight].get_with_shape<xpu, 3, real_t>(wmat_shape, s);
 #if defined(__CUDACC__)
@@ -201,13 +188,17 @@ class ConvolutionOp : public Operator {
                                      param_.kernel[0],
                                      param_.kernel[1],
                                      param_.stride[0],
-                                     param_.stride[1]);
+                                     param_.stride[1],
+                                     param_.dilate[0],
+                                     param_.dilate[1]);
       } else {
         temp_col = unpack_patch2col(pad(data.Slice(i, i + step), param_.pad[0], param_.pad[1]),
                                      param_.kernel[0],
                                      param_.kernel[1],
                                      param_.stride[0],
-                                     param_.stride[1]);
+                                     param_.stride[1],
+                                     param_.dilate[0],
+                                     param_.dilate[1]);
       }
       const index_t gstride = temp_col.size(0) / param_.num_group;
       for (uint32_t gid = 0; gid < param_.num_group; ++gid) {
@@ -229,7 +220,8 @@ class ConvolutionOp : public Operator {
                                      data.Slice(i, i + step).shape_,
                                      param_.kernel[0],
                                      param_.kernel[1],
-                                     param_.stride[0]);
+                                     param_.stride[0],
+                                     param_.dilate[0]);
         } else {
           Shape<4> pshape = data.Slice(i, i + step).shape_;
           pshape[2] += 2 * param_.pad[0];
@@ -238,7 +230,8 @@ class ConvolutionOp : public Operator {
                                           pshape,
                                           param_.kernel[0],
                                           param_.kernel[1],
-                                          param_.stride[0]),
+                                          param_.stride[0],
+                                          param_.dilate[0]),
                                           gdata[i][0].shape_);
         }
       }
@@ -259,20 +252,24 @@ class ConvolutionOp : public Operator {
     shape_dstunit_ = mshadow::Shape3(param_.num_group,
                                      param_.num_filter / param_.num_group,
                                      oshape[2] * oshape[3]);
-    const uint64_t workspace_size = param_.workspace;
-    nstep_ = std::max(std::min(static_cast<index_t>(workspace_size / shape_colunit_.Size()),
-                               ishape[0]), 1U);
-    int nop = (ishape[0] + nstep_ - 1) / nstep_;
-    nstep_ = (ishape[0] + nop - 1) / nop;
+    // param_.workspace is in elements of sizeof(real_t)
+    // if param_.workspace is set to zero the nstep_ equals ishape[0] (batch)
+    nstep_ = std::max(
+        std::min(
+          static_cast<index_t>(param_.workspace / (shape_colunit_.Size() + shape_dstunit_.Size())),
+          ishape[0]),
+        1U);
+
     mshadow::Shape<2> scol = mshadow::Shape2(shape_colunit_[0],
                                              shape_colunit_[1] * nstep_);
     mshadow::Shape<3> sdst = mshadow::Shape3(shape_dstunit_[0],
                                              shape_dstunit_[1],
                                              shape_dstunit_[2] * nstep_);
-    CHECK_GE(param_.workspace, scol.Size() + sdst.Size())
-      << "\nMinimum workspace size: " << scol.Size() + sdst.Size() << "\n"
-      << "Given: " << param_.workspace;
-    return scol.Size() + sdst.Size();
+    index_t required_size = scol.Size() + sdst.Size();
+    CHECK_GE(param_.workspace, required_size)
+      << "\nMinimum workspace size: " << required_size * sizeof(real_t) << " Bytes\n"
+      << "Given: " << param_.workspace * sizeof(real_t) << " Bytes";
+    return required_size;
   }
 
   ConvolutionParam param_;
@@ -334,11 +331,15 @@ class ConvolutionProp : public OperatorProperty {
         << "incorrect kernel size: " << param_.kernel;
     CHECK_GE(param_.stride.Size(), 0) \
         << "incorrect stride size: " << param_.stride;
+    CHECK_GE(param_.dilate.Size(), 0) \
+        << "incorrect dilate size: " << param_.dilate;
     CHECK(ksize_x <= dshape[3] && ksize_y <= dshape[2])
         << "kernel size exceed input";
     (*out_shape)[conv::kOut][1] = param_.num_filter;
-    (*out_shape)[conv::kOut][2] = (dshape[2] + 2 * param_.pad[0] - ksize_y) / param_.stride[0] + 1;
-    (*out_shape)[conv::kOut][3] = (dshape[3] + 2 * param_.pad[1] - ksize_x) / param_.stride[1] + 1;
+    (*out_shape)[conv::kOut][2] = (dshape[2] + 2 * param_.pad[0] -
+        (param_.dilate[0] == 1 ? ksize_y : ksize_y * param_.dilate[0] - 1)) / param_.stride[0] + 1;
+    (*out_shape)[conv::kOut][3] = (dshape[3] + 2 * param_.pad[1] -
+        (param_.dilate[1] == 1 ? ksize_x : ksize_x * param_.dilate[1] - 1)) / param_.stride[1] + 1;
     return true;
   }
 

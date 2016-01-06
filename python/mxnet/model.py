@@ -16,6 +16,7 @@ from .context import Context, cpu
 from .initializer import Uniform
 from collections import namedtuple
 from .optimizer import get_updater
+from .executor import DataParallelExecutorManager, _check_arguments, _load_data
 
 BASE_ESTIMATOR = object
 
@@ -31,79 +32,6 @@ BatchEndParam = namedtuple('BatchEndParams',
                             'nbatch',
                             'eval_metric'])
 
-def _load_general(data, targets):
-    """Load a list of arrays into a list of arrays specified by slices"""
-    for d_src, d_targets in zip(data, targets):
-        if isinstance(d_targets, nd.NDArray):
-            d_src.copyto(d_targets)
-        else:
-            for slice_idx, d_dst in d_targets:
-                d_src[slice_idx].copyto(d_dst)
-def _load_data(batch, targets):
-    """Load data into sliced arrays"""
-    _load_general(batch.data, targets)
-def _load_label(batch, targets):
-    """Load label into sliced arrays"""
-    _load_general(batch.label, targets)
-
-
-def _check_arguments(symbol):
-    """Check the argument names of symbol.
-    This function checks the duplication of arguments in Symbol.
-    The check is done for feedforward net for now.
-    Parameters
-    ----------
-    symbol : Symbol
-        The network configuration
-    """
-    arg_set = set()
-    arg_names = symbol.list_arguments()
-    for name in arg_names:
-        if name in arg_set:
-            raise ValueError(('Find duplicated argument name \"%s\", ' +
-                              'please make the weight name non-duplicated(using name arguments), ' +
-                              'arguments are %s') % (name, str(arg_names)))
-        arg_set.add(name)
-
-    aux_set = set()
-    aux_names = symbol.list_auxiliary_states()
-    for name in aux_names:
-        if name in aux_set:
-            raise ValueError(
-                ('Find duplicated auxiliary param name \"%s\", ' +
-                 'please make the weight name non-duplicated(using name arguments), ' +
-                 'arguments are %s, auxiliary params are %s'
-                ) % (name, str(arg_names), str(aux_names)))
-        aux_set.add(name)
-
-
-def _split_input_slice(batch_size, num_split):
-    """Get input slice from the input shape.
-    Parameters
-    ----------
-    batch_size : int
-        The number of samples in a mini-batch.
-    num_split : int
-        The number of split we want to have.
-    Returns
-    -------
-    slices : list of slice
-        The split slices to get a specific slice.
-    Raises
-    ------
-    ValueError
-        If there are two many splits such that some slice can be empty.
-    """
-    step = (batch_size + num_split - 1) / num_split
-    slices = []
-    for k in range(num_split):
-        begin = int(min(k * step, batch_size))
-        end = int(min((k+1) * step, batch_size))
-        if begin == end:
-            raise ValueError('Too many slices such that some splits are empty')
-        slices.append(slice(begin, end))
-    return slices
-
 def _create_kvstore(kvstore, num_device, arg_params):
     """Create kvstore
     This function select and create a proper kvstore if given the kvstore type
@@ -117,7 +45,9 @@ def _create_kvstore(kvstore, num_device, arg_params):
         Model parameter, dict of name to NDArray of net's weights.
     """
 
-    if isinstance(kvstore, kvs.KVStore):
+    if kvstore is None:
+        kv = None
+    elif isinstance(kvstore, kvs.KVStore):
         kv = kvstore
     elif isinstance(kvstore, str):
         # create kvstore using the string type
@@ -135,7 +65,7 @@ def _create_kvstore(kvstore, num_device, arg_params):
                 logging.info('Auto-select kvstore type = %s', kvstore)
             kv = kvs.create(kvstore)
     else:
-        raise TypeError('kvstore must be either KVStore or str')
+        raise TypeError('kvstore must be KVStore, str or None')
 
     # detect whether or not update weight on kvstore
     update_on_kvstore = True
@@ -144,13 +74,53 @@ def _create_kvstore(kvstore, num_device, arg_params):
 
     return (kv, update_on_kvstore)
 
+def _initialize_kvstore(kvstore, param_arrays, arg_params, param_names,
+                        update_on_kvstore):
+    """ Initialize kvstore"""
+    for idx in range(len(param_arrays)):
+        param_on_devs = param_arrays[idx]
+        kvstore.init(idx, arg_params[param_names[idx]])
+
+        if update_on_kvstore:
+            kvstore.pull(idx, param_on_devs, priority=-idx)
+
+def _update_params_on_kvstore(param_arrays, grad_arrays, kvstore):
+    """ Perform update of param_arrays from grad_arrays on kvstore."""
+    for index, pair in enumerate(zip(param_arrays, grad_arrays)):
+        arg_list, grad_list = pair
+        if grad_list[0] is None:
+            continue
+        # push gradient, priority is negative index
+        kvstore.push(index, grad_list, priority=-index)
+        # pull back the weights
+        kvstore.pull(index, arg_list, priority=-index)
+
+def _update_params(param_arrays, grad_arrays, updater, num_device,
+                   kvstore=None):
+    """ Perform update of param_arrays from grad_arrays not on kvstore."""
+    for index, pair in enumerate(zip(param_arrays, grad_arrays)):
+        arg_list, grad_list = pair
+        if grad_list[0] is None:
+            continue
+        if kvstore:
+            # push gradient, priority is negative index
+            kvstore.push(index, grad_list, priority=-index)
+            # pull back the sum gradients, to the same locations.
+            kvstore.pull(index, grad_list, priority=-index)
+        for k, p in enumerate(zip(arg_list, grad_list)):
+            # faked an index here, to make optimizer create diff
+            # state for the same index but on diff devs, TODO(mli)
+            # use a better solution latter
+            w, g = p
+            updater(index*num_device+k, g, w)
+
 def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
                         arg_params, aux_params,
                         begin_epoch, end_epoch, epoch_size, optimizer,
                         kvstore, update_on_kvstore,
                         train_data, eval_data=None, eval_metric=None,
                         epoch_end_callback=None, batch_end_callback=None,
-                        logger=None):
+                        logger=None, work_load_list=None, monitor=None):
     """Internal training function on multiple devices.
     This function will also work for single device as well.
     Parameters
@@ -198,69 +168,40 @@ def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
         whether or not perform weight updating on kvstore
     logger : logging logger
         When not specified, default logger will be used.
+    work_load_list : list of float or int, optional
+        The list of work load for different devices,
+        in the same order as ctx
     Notes
     -----
     - This function will inplace update the NDArrays in arg_parans and aux_states.
     """
     if logger is None:
         logger = logging
-    # preparation
-    num_device = len(ctx)
-    logging.info('Start training with %s', str(ctx))
+    executor_manager = DataParallelExecutorManager(symbol=symbol,
+                                                   ctx=ctx,
+                                                   train_data=train_data,
+                                                   param_names=param_names,
+                                                   arg_names=arg_names,
+                                                   aux_names=aux_names,
+                                                   work_load_list=work_load_list,
+                                                   logger=logger)
+    if monitor:
+        executor_manager.install_monitor(monitor)
 
-    # make sure the architecture is valid
-    _check_arguments(symbol)
-
-    slices = _split_input_slice(train_data.batch_size, num_device)
-    train_execs = []
-    for i in range(len(ctx)):
-        data_shapes = {k: tuple([slices[i].stop-slices[i].start] + list(v[1:]))
-                       for k, v in train_data.provide_data}
-        train_exec = symbol.simple_bind(ctx[i], 'write', **data_shapes)
-        train_execs.append(train_exec)
-
-    # data structure
-    data_names = [x[0] for x in train_data.provide_data]
-    label_names = [x[0] for x in train_data.provide_label]
-
-    data_arrays = [[(slices[i], e.arg_dict[name]) for i, e in enumerate(train_execs)]
-                   for name in data_names]
-    label_arrays = [[(slices[i], e.arg_dict[name]) for i, e in enumerate(train_execs)]
-                    for name in label_names]
-
-    param_idx = [i for i in range(len(arg_names)) if arg_names[i] in param_names]
-    param_names = [arg_names[i] for i in param_idx]
-    param_arrays = [[e.arg_arrays[i] for e in train_execs] for i in param_idx]
-    grad_arrays = [[e.grad_arrays[i] for e in train_execs] for i in param_idx]
-    aux_arrays = [[e.aux_arrays[i] for e in train_execs] for i in range(len(aux_names))]
-
-    for texec in train_execs:
-        texec.copy_params_from(arg_params, aux_params)
-
-    # init optmizer
-    optimizer.begin_epoch(begin_epoch)
+    executor_manager.set_params(arg_params, aux_params)
 
     if not update_on_kvstore:
         updater = get_updater(optimizer)
 
-    # init kvstore
     if kvstore:
-        # init optimizer
-        if update_on_kvstore:
-            kvstore.set_optimizer(optimizer)
+        _initialize_kvstore(kvstore=kvstore,
+                            param_arrays=executor_manager.param_arrays,
+                            arg_params=arg_params,
+                            param_names=executor_manager.param_names,
+                            update_on_kvstore=update_on_kvstore)
 
-        # init kv
-        for idx in range(len(param_arrays)):
-            param_on_devs = param_arrays[idx]
-            kvstore.init(idx, arg_params[param_names[idx]])
-
-            if update_on_kvstore:
-                kvstore.pull(idx, param_on_devs, priority=-idx)
-
-    batch_size = train_data.batch_size
-
-    output_shapes = [tuple([batch_size]+list(x.shape[1:])) for x in train_execs[0].outputs]
-    cpu_output_arrays = [nd.zeros(s) for s in output_shapes]
+    if update_on_kvstore:
+        kvstore.set_optimizer(optimizer)
 
     # Now start training
     for epoch in range(begin_epoch, end_epoch):
@@ -271,41 +212,33 @@ def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
         # Iterate over training data.
         train_data.reset()
         while True:
+            do_reset = True
             for data_batch in train_data:
-                _load_data(data_batch, data_arrays)
-                _load_label(data_batch, label_arrays)
 
-                # forward backward pass
-                for texec, islice in zip(train_execs, slices):
-                    texec.forward(is_train=True)
-                    for cpu_out, dev_out in zip(cpu_output_arrays, texec.outputs):
-                        dev_out.copyto(cpu_out[islice])
-                    #texec.outputs[0].copyto(out_cpu_array[islice])
-                for texec in train_execs:
-                    texec.backward()
+                executor_manager.load_data_batch(data_batch)
 
-                # update the parameters
-                for index, pair in enumerate(zip(param_arrays, grad_arrays)):
-                    arg_list, grad_list = pair
-                    if grad_list[0] is None:
-                        continue
-                    # Gradient synchronization
-                    if kvstore:
-                        # push gradient, priority is negative index
-                        kvstore.push(index, grad_list, priority=-index)
-                        if update_on_kvstore:
-                            # pull back the weights
-                            kvstore.pull(index, arg_list, priority=-index)
-                        else:
-                            # pull back the sum gradients, to the same locations.
-                            kvstore.pull(index, grad_list, priority=-index)
-                    if not update_on_kvstore:
-                        for k, p in enumerate(zip(arg_list, grad_list)):
-                            # faked an index here, to make optimizer create diff
-                            # state for the same index but on diff devs, TODO(mli)
-                            # use a better solution latter
-                            w, g = p
-                            updater(index*num_device+k, g, w)
+                if monitor is not None:
+                    monitor.tic()
+
+                executor_manager.forward(is_train=True)
+                executor_manager.backward()
+
+                if update_on_kvstore:
+                    _update_params_on_kvstore(executor_manager.param_arrays,
+                                              executor_manager.grad_arrays,
+                                              kvstore)
+                else:
+                    _update_params(executor_manager.param_arrays,
+                                   executor_manager.grad_arrays,
+                                   updater=updater,
+                                   num_device=len(ctx),
+                                   kvstore=kvstore)
+
+                if monitor is not None:
+                    monitor.toc_print()
+
+                # evaluate at end, so out_cpu_array can lazy copy
+                eval_metric.update(data_batch.label, executor_manager.cpu_output_arrays)
 
                 nbatch += 1
                 # batch callback (for print purpose)
@@ -319,22 +252,16 @@ def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
                     else:
                         batch_end_callback(batch_end_params)
 
-                # evaluate at end, so out_cpu_array can lazy copy
-                eval_metric.update(data_batch.label, cpu_output_arrays)
-
-                # this epoch is done
-                if epoch_size is not None and nbatch == epoch_size:
+                # this epoch is done possibly earlier
+                if epoch_size is not None and nbatch >= epoch_size:
+                    do_reset = False
                     break
 
-            # reset the training data if reach the end of train_data, we only
-            # need to deal with the following two situations:
-            # 1. epoch_size is None:
-            # 2. epoch_size is not None but nbatch != epoch_size:
-            if epoch_size is None or nbatch != epoch_size:
+            if do_reset == True:
                 train_data.reset()
 
             # this epoch is done
-            if epoch_size is None or nbatch == epoch_size:
+            if epoch_size is None or nbatch >= epoch_size:
                 break
 
         name, value = eval_metric.get()
@@ -346,26 +273,15 @@ def _train_multi_device(symbol, ctx, arg_names, param_names, aux_names,
             eval_metric.reset()
             eval_data.reset()
             for eval_batch in eval_data:
-                _load_data(eval_batch, data_arrays)
-                _load_label(eval_batch, label_arrays)
+                executor_manager.load_data_batch(eval_batch)
+                executor_manager.forward(is_train=False)
+                eval_metric.update(eval_batch.label, executor_manager.cpu_output_arrays)
 
-                # forward pass
-                for texec, islice in zip(train_execs, slices):
-                    texec.forward(is_train=False)
-                    for cpu_out, dev_out in zip(cpu_output_arrays, texec.outputs):
-                        dev_out.copyto(cpu_out[islice])
-                eval_metric.update(eval_batch.label, cpu_output_arrays)
             name, value = eval_metric.get()
             logger.info('Epoch[%d] Validation-%s=%f', epoch, name, value)
 
         if epoch_end_callback or epoch + 1 == end_epoch:
-            # copy data back to cpu
-            for name, block in zip(param_names, param_arrays):
-                weight = sum(w.copyto(cpu()) for w in block) / len(block)
-                weight.copyto(arg_params[name])
-            for name, block in zip(aux_names, aux_arrays):
-                weight = sum(w.copyto(cpu()) for w in block) / len(block)
-                weight.copyto(aux_params[name])
+            executor_manager.copy_to(arg_params, aux_params)
 
         if epoch_end_callback != None:
             if isinstance(epoch_end_callback, list):
@@ -422,8 +338,8 @@ def load_checkpoint(prefix, epoch):
         Model parameter, dict of name to NDArray of net's auxiliary states.
     Notes
     -----
-    - ``prefix-symbol.json`` will be saved for symbol.
-    - ``prefix-epoch.params`` will be saved for parameters.
+    - symbol will be loaded from ``prefix-symbol.json``.
+    - parameters will be loaded from ``prefix-epoch.params``.
     """
     symbol = sym.load('%s-symbol.json' % prefix)
     save_dict = nd.load('%s-%04d.params' % (prefix, epoch))
@@ -455,7 +371,7 @@ class FeedForward(BASE_ESTIMATOR):
         ceil(num_train_examples / batch_size)
     optimizer : str or Optimizer, optional
         Training parameter, name or optimizer object for training.
-    initializier : initializer function, optional
+    initializer : initializer function, optional
         Training parameter, the initialization scheme used.
     numpy_batch_size : int, optional
         The batch size of training data.
@@ -529,26 +445,24 @@ class FeedForward(BASE_ESTIMATOR):
         param_names = list(set(arg_names) - set(input_names))
         aux_names = self.symbol.list_auxiliary_states()
 
-        arg_defined = True
-        aux_defined = True
+        param_name_shapes = [x for x in zip(arg_names, arg_shapes) if x[0] in param_names]
+        arg_params = {k : nd.zeros(s) for k, s in param_name_shapes}
+        aux_params = {k : nd.zeros(s) for k, s in zip(aux_names, aux_shapes)}
 
-        if self.arg_params is None:
-            arg_defined = False
-            param_name_shapes = [x for x in zip(arg_names, arg_shapes) if x[0] in param_names]
-            self.arg_params = {k : nd.zeros(s) for k, s in param_name_shapes}
-
-        if self.aux_params is None:
-            aux_defined = False
-            self.aux_params = {k : nd.zeros(s) for k, s in zip(aux_names, aux_shapes)}
-
-        if (not arg_defined) or overwrite:
-            for k, v in self.arg_params.items():
+        for k, v in arg_params.items():
+            if self.arg_params and k in self.arg_params and (not overwrite):
+                arg_params[k][:] = self.arg_params[k][:]
+            else:
                 self.initializer(k, v)
 
-        if (not aux_defined) or overwrite:
-            for k, v in self.aux_params.items():
+        for k, v in aux_params.items():
+            if self.aux_params and k in self.aux_params and (not overwrite):
+                aux_params[k][:] = self.aux_params[k][:]
+            else:
                 self.initializer(k, v)
 
+        self.arg_params = arg_params
+        self.aux_params = aux_params
         return (arg_names, param_names, aux_names)
 
     def __getstate__(self):
@@ -616,11 +530,13 @@ class FeedForward(BASE_ESTIMATOR):
                             'NDArray/numpy.ndarray/list pair (i.e. tuple/list of length 2)')
         return eval_data
 
-    def predict(self, X):
+    def predict(self, X, num_batch=None):
         """Run the prediction, always only use one device.
         Parameters
         ----------
         X : mxnet.DataIter
+        num_batch : int or None
+            the number of batch to run. Go though all batches if None
         Returns
         -------
         y : numpy.ndarray or a list of numpy.ndarray if the network has multiple outputs.
@@ -636,7 +552,12 @@ class FeedForward(BASE_ESTIMATOR):
         data_arrays = [self._pred_exec.arg_dict[name] for name in data_names]
         output_list = [[] for _ in range(len(self._pred_exec.outputs))]
 
+        i = 0
         for batch in X:
+            if num_batch is not None and i == num_batch:
+                break
+            i += 1
+
             _load_data(batch, data_arrays)
             self._pred_exec.forward(is_train=False)
             padded = batch.pad
@@ -653,12 +574,15 @@ class FeedForward(BASE_ESTIMATOR):
             return outputs
 
     def fit(self, X, y=None, eval_data=None, eval_metric='acc',
-            epoch_end_callback=None, batch_end_callback=None, kvstore='local', logger=None):
+            epoch_end_callback=None, batch_end_callback=None, kvstore='local', logger=None,
+            work_load_list=None, monitor=None):
         """Fit the model.
         Parameters
         ----------
         X : DataIter, or numpy.ndarray/NDArray
-            Training data.
+            Training data. If X is an DataIter, the name or, if not available,
+            position, of its outputs should match the corresponding variable
+            names defined in the symbolic graph.
         y : numpy.ndarray/NDArray, optional
             Training set label.
             If X is numpy.ndarray/NDArray, y is required to be set.
@@ -687,6 +611,9 @@ class FeedForward(BASE_ESTIMATOR):
            In default uses 'local', often no need to change for single machiine.
         logger : logging logger, optional
             When not specified, default logger will be used.
+        work_load_list : float or int, optional
+            The list of work load for different devices,
+            in the same order as ctx
         """
 
         data = self._init_iter(X, y, is_train=True)
@@ -694,6 +621,7 @@ class FeedForward(BASE_ESTIMATOR):
 
         arg_names, param_names, aux_names = \
                 self._init_params(dict(data.provide_data+data.provide_label))
+        self.kwargs["arg_names"] = arg_names
 
         # setup metric
         if not isinstance(eval_metric, metric.EvalMetric):
@@ -725,7 +653,7 @@ class FeedForward(BASE_ESTIMATOR):
                             epoch_end_callback=epoch_end_callback,
                             batch_end_callback=batch_end_callback,
                             kvstore=kvstore, update_on_kvstore=update_on_kvstore,
-                            logger=logger)
+                            logger=logger, work_load_list=work_load_list, monitor=monitor)
 
 
     def save(self, prefix, epoch=None):
@@ -782,8 +710,9 @@ class FeedForward(BASE_ESTIMATOR):
     @staticmethod
     def create(symbol, X, y=None, ctx=None,
                num_epoch=None, epoch_size=None, optimizer='sgd', initializer=Uniform(0.01),
-               eval_data=None, eval_metric='acc', epoch_end_callback=None,
-               kvstore='local', logger=None, **kwargs):
+               eval_data=None, eval_metric='acc',
+               epoch_end_callback=None, batch_end_callback=None,
+               kvstore='local', logger=None, work_load_list=None, **kwargs):
         """Functional style to create a model.
         This function will be more consistent with functional
         languages such as R, where mutation is not allowed.
@@ -816,6 +745,9 @@ class FeedForward(BASE_ESTIMATOR):
         epoch_end_callback : callable(epoch, symbol, arg_params, aux_states)
             A callback that is invoked at end of each epoch.
             This can be used to checkpoint model each epoch.
+        batch_end_callback: callable(epoch)
+            A callback that is invoked at end of each batch
+            For print purpose
         kvstore: KVStore or str, optional
            The KVStore or a string kvstore type:
            'local' : multi-devices on a single machine, will automatically
@@ -824,11 +756,18 @@ class FeedForward(BASE_ESTIMATOR):
            'dist_sync' : multi-machines with BSP
            'dist_async' : multi-machines with partical asynchronous
            In default uses 'local', often no need to change for single machiine.
+        logger : logging logger, optional
+            When not specified, default logger will be used.
+        work_load_list : list of float or int, optional
+            The list of work load for different devices,
+            in the same order as ctx
         """
         model = FeedForward(symbol, ctx=ctx, num_epoch=num_epoch, epoch_size=epoch_size,
                             optimizer=optimizer, initializer=initializer, **kwargs)
         model.fit(X, y, eval_data=eval_data, eval_metric=eval_metric,
                   epoch_end_callback=epoch_end_callback,
+                  batch_end_callback=batch_end_callback,
                   kvstore=kvstore,
-                  logger=logger)
+                  logger=logger,
+                  work_load_list=work_load_list)
         return model

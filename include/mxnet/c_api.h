@@ -10,7 +10,7 @@
 #define MXNET_EXTERN_C extern "C"
 #endif
 
-/*! \brief MXNET_DLL prefix for windows" */
+/*! \brief MXNET_DLL prefix for windows */
 #ifdef _WIN32
 #ifdef MXNET_EXPORTS
 #define MXNET_DLL MXNET_EXTERN_C __declspec(dllexport)
@@ -20,6 +20,9 @@
 #else
 #define MXNET_DLL MXNET_EXTERN_C
 #endif
+
+//added by mzhang
+#include <inttypes.h>
 
 /*! \brief manually define unsigned int */
 typedef unsigned int mx_uint;
@@ -48,6 +51,16 @@ typedef void *DataIterHandle;
 typedef void *KVStoreHandle;
 /*! \brief handle to RecordIO */
 typedef void *RecordIOHandle;
+/*! \brief handle to MXRtc*/
+typedef void *RtcHandle;
+/*! \brief handle to a function that takes param and creates optimizer*/
+typedef void *OptimizerCreator;
+/*! \brief handle to Optimizer*/
+typedef void *OptimizerHandle;
+
+MXNET_EXTERN_C typedef void (*ExecutorMonitorCallback)(const char*,
+                                                       NDArrayHandle,
+                                                       void *);
 
 MXNET_EXTERN_C {
 struct NativeOpInfo {
@@ -62,6 +75,23 @@ struct NativeOpInfo {
   void* p_infer_shape;
   void* p_list_outputs;
   void* p_list_arguments;
+};
+
+struct NDArrayOpInfo {
+  bool (*forward)(int, void**, int*, void*);
+  bool (*backward)(int, void**, int*, void*);
+  bool (*infer_shape)(int, int*, unsigned**, void*);
+  bool (*list_outputs)(char***, void*);
+  bool (*list_arguments)(char***, void*);
+  bool (*declare_backward_dependency)(const int*, const int*, const int*,
+                                      int*, int**, void*);
+  // all functions also pass a payload void* pointer
+  void* p_forward;
+  void* p_backward;
+  void* p_infer_shape;
+  void* p_list_outputs;
+  void* p_list_arguments;
+  void* p_declare_backward_dependency;
 };
 }
 /*!
@@ -154,11 +184,13 @@ MXNET_DLL int MXNDArraySave(const char* fname,
                             const char** keys);
 
 
-int MXNDArrayLoadFromBytes(const void* data, size_t param_size, 
+//added by mzhang
+int MXNDArrayLoadFromBytes(const void* param_bytes, size_t param_size, 
                   mx_uint *out_size,
                   NDArrayHandle** out_arr,
                   mx_uint *out_name_size,
                   const char*** out_names);
+
 
 /*!
  * \brief Load list of narray from the file.
@@ -452,6 +484,37 @@ MXNET_DLL int MXSymbolCopy(SymbolHandle symbol, SymbolHandle *out);
  */
 MXNET_DLL int MXSymbolPrint(SymbolHandle symbol, const char **out_str);
 /*!
+ * \brief Get string attribute from symbol
+ * \param symbol the source symbol
+ * \param key The key of the symbol.
+ * \param out The result attribute, can be NULL if the attribute do not exist.
+ * \param success Whether the result is contained in out.
+ * \return 0 when success, -1 when failure happens
+ */
+MXNET_DLL int MXSymbolGetAttr(SymbolHandle symbol,
+                              const char* key,
+                              const char** out,
+                              int *success);
+/*!
+ * \brief Set string attribute from symbol.
+ *  NOTE: Setting attribute to a symbol can affect the semantics(mutable/immutable) of symbolic graph.
+ *
+ *  Safe recommendaton: use  immutable graph
+ *  - Only allow set attributes during creation of new symbol as optional parameter
+ *
+ *  Mutable graph (be careful about the semantics):
+ *  - Allow set attr at any point.
+ *  - Mutating an attribute of some common node of two graphs can cause confusion from user.
+ *
+ * \param symbol the source symbol
+ * \param key The key of the symbol.
+ * \param value The value to be saved.
+ * \return 0 when success, -1 when failure happens
+ */
+MXNET_DLL int MXSymbolSetAttr(SymbolHandle symbol,
+                              const char* key,
+                              const char* value);
+/*!
  * \brief List arguments in the symbol.
  * \param symbol the symbol
  * \param out_size output size
@@ -642,7 +705,47 @@ MXNET_DLL int MXExecutorBind(SymbolHandle symbol_handle,
                              mx_uint aux_states_len,
                              NDArrayHandle *aux_states,
                              ExecutorHandle *out);
-
+/*!
+ * \brief Generate Executor from symbol,
+ *  This is advanced function, allow specify group2ctx map.
+ *  The user can annotate "ctx_group" attribute to name each group.
+ *
+ * \param symbol_handle symbol handle
+ * \param dev_type device type of default context
+ * \param dev_id device id of default context
+ * \param num_map_keys size of group2ctx map
+ * \param map_keys keys of group2ctx map
+ * \param map_dev_types device type of group2ctx map
+ * \param map_dev_ids device id of group2ctx map
+ * \param len length
+ * \param in_args in args array
+ * \param arg_grad_store arg grads handle array
+ * \param grad_req_type grad req array
+ * \param aux_states_len length of auxiliary states
+ * \param aux_states auxiliary states array
+ * \param out output executor handle
+ * \return 0 when success, -1 when failure happens
+ */
+MXNET_DLL int MXExecutorBindX(SymbolHandle symbol_handle,
+                              int dev_type,
+                              int dev_id,
+                              mx_uint num_map_keys,
+                              const char** map_keys,
+                              const int* map_dev_types,
+                              const int* map_dev_ids,
+                              mx_uint len,
+                              NDArrayHandle *in_args,
+                              NDArrayHandle *arg_grad_store,
+                              mx_uint *grad_req_type,
+                              mx_uint aux_states_len,
+                              NDArrayHandle *aux_states,
+                              ExecutorHandle *out);
+/*!
+ * \brief set a call back to notify the completion of operation
+ */
+MXNET_DLL int MXExecutorSetMonitorCallback(ExecutorHandle handle,
+                                           ExecutorMonitorCallback callback,
+                                           void* callback_handle);
 //--------------------------------------------
 // Part 5: IO Interface
 //--------------------------------------------
@@ -716,7 +819,16 @@ MXNET_DLL int MXDataIterBeforeFirst(DataIterHandle handle);
  */
 MXNET_DLL int MXDataIterGetData(DataIterHandle handle,
                                 NDArrayHandle *out);
-
+/*!
+ * \brief Get the image index by array.
+ * \param handle the handle pointer to the data iterator
+ * \param out_index output index of the array.
+ * \param out_size output size of the array.
+ * \return 0 when success, -1 when failure happens
+ */
+MXNET_DLL int MXDataIterGetIndex(DataIterHandle handle,
+                                 uint64_t **out_index,
+                                 uint64_t *out_size);
 /*!
  * \brief Get the padding number in current data batch
  * \param handle the handle pointer to the data iterator
@@ -958,4 +1070,47 @@ MXNET_DLL int MXRecordIOReaderFree(RecordIOHandle *handle);
 */
 MXNET_DLL int MXRecordIOReaderReadRecord(RecordIOHandle *handle,
                                         char const **buf, size_t *size);
+
+/**
+ * \brief Create a MXRtc object
+*/
+MXNET_DLL int MXRtcCreate(char* name, mx_uint num_input, mx_uint num_output,
+                          char** input_names, char** output_names,
+                          NDArrayHandle* inputs, NDArrayHandle* outputs,
+                          char* kernel, RtcHandle *out);
+
+/**
+ * \brief Run cuda kernel
+*/
+MXNET_DLL int MXRtcPush(RtcHandle handle, mx_uint num_input, mx_uint num_output,
+                        NDArrayHandle* inputs, NDArrayHandle* outputs,
+                        mx_uint gridDimX,
+                        mx_uint gridDimY,
+                        mx_uint gridDimZ,
+                        mx_uint blockDimX,
+                        mx_uint blockDimY,
+                        mx_uint blockDimZ);
+
+/**
+ * \brief Delete a MXRtc object
+*/
+MXNET_DLL int MXRtcFree(RtcHandle handle);
+
+MXNET_DLL int MXOptimizerFindCreator(const char *key,
+                                     OptimizerCreator *out);
+
+MXNET_DLL int MXOptimizerCreateOptimizer(OptimizerCreator creator,
+                                         mx_uint num_param,
+                                         const char **keys,
+                                         const char **vals,
+                                         OptimizerHandle *out);
+
+MXNET_DLL int MXOptimizerFree(OptimizerHandle handle);
+
+MXNET_DLL int MXOptimizerUpdate(OptimizerHandle handle,
+                                int index,
+                                NDArrayHandle weight,
+                                NDArrayHandle grad,
+                                mx_float lr);
+
 #endif  // MXNET_C_API_H_

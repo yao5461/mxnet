@@ -12,36 +12,26 @@
 #include "../operator/operator_common.h"
 
 namespace mxnet {
-std::vector<uint32_t> StaticGraph::TopoSort() const {
-  std::vector<std::pair<uint32_t, uint32_t> > stack;
+
+std::vector<uint32_t> StaticGraph::PostDFSOrder(const std::vector<uint32_t>& head_nodes,
+                                                const std::unordered_set<uint32_t>& banned) const {
+  std::vector<uint32_t> ret;
   std::unordered_set<uint32_t> visited;
-  std::vector<uint32_t> ret(nodes.size());
-  std::vector<uint32_t> head_node;
-  // out degree
-  std::vector<int> out_degree(nodes.size(), 0);
-  for (const Node& n : nodes) {
-    for (const DataEntry& e : n.inputs) {
-      ++out_degree[e.source_id];
-    }
-    if (n.is_backward()) {
-      ++out_degree[n.backward_source_id];
-    }
-  }
-  for (size_t i = 0; i < nodes.size(); ++i) {
-    if (out_degree[i] == 0) {
-      stack.push_back(std::make_pair(static_cast<uint32_t>(i), 0));
-    }
-  }
+  ret.reserve(nodes.size() / 2);
+  std::vector<std::pair<uint32_t, uint32_t> > stack;
   // heads
-  for (auto &head : head_node) {
+  for (auto head : head_nodes) {
+    if (visited.count(head) != 0) continue;
     stack.push_back(std::make_pair(head, 0));
+    CHECK_EQ(banned.count(head), 0);
+    // bugfix
+    visited.insert(head);
   }
-  int count = 0;
   while (!stack.empty()) {
     std::pair<uint32_t, uint32_t>& back = stack.back();
     const Node& n = nodes[back.first];
     if (back.second == n.inputs.size() + (n.is_backward() ? 1 : 0)) {
-      ret[count++] = back.first;
+      ret.push_back(back.first);
       visited.insert(back.first);
       stack.pop_back();
     } else {
@@ -52,12 +42,32 @@ std::vector<uint32_t> StaticGraph::TopoSort() const {
       } else {
         input = n.inputs[back.second++].source_id;
       }
-      if (visited.count(input) == 0) {
+      if (visited.count(input) == 0 && banned.count(input) == 0) {
         stack.push_back(std::make_pair(input, 0));
       }
     }
   }
   return ret;
+}
+
+std::vector<uint32_t> StaticGraph::TopoSort() const {
+  // out degree
+  std::vector<int> out_degree(nodes.size(), 0);
+  for (const Node& n : nodes) {
+    for (const DataEntry& e : n.inputs) {
+      ++out_degree[e.source_id];
+    }
+    if (n.is_backward()) {
+      ++out_degree[n.backward_source_id];
+    }
+  }
+  std::vector<uint32_t> head_nodes;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (out_degree[i] == 0) {
+      head_nodes.push_back(static_cast<uint32_t>(i));
+    }
+  }
+  return PostDFSOrder(head_nodes, std::unordered_set<uint32_t>());
 }
 
 bool StaticGraph::InferNodeShapes(const std::vector<uint32_t> &topo_order,
@@ -130,6 +140,21 @@ bool StaticGraph::InferNodeShapes(const std::vector<uint32_t> &topo_order,
           throw dmlc::Error(os.str());
         }
       }
+
+      // set for auxilary states shape.
+      auto& source_aux_shapes = (*node_aux_shapes)[node.backward_source_id];
+      for (size_t i = 0; i < source_aux_shapes.size(); ++i) {
+        try {
+          (*node_aux_shapes)[nid].push_back(source_aux_shapes[i]);
+        } catch (const op::InferShapeError &err) {
+          const std::string &op_name = nodes[nid].name;
+          std::ostringstream os;
+          os << "InferShape Error in "
+             << op_name << "\'s" << " aux states\n"
+             << err.msg;
+          throw dmlc::Error(os.str());
+        }
+      }
     }
   }
   // TODO(bing) assign shape for head gradient
@@ -166,10 +191,20 @@ bool StaticGraph::InferShape(std::vector<TShape> *in_shape,
     const DataEntry &e = heads[i];
     (*out_shape)[i] = node_out_shapes[e.source_id][e.index];
   }
+
+  // set back auxiliary nodes.
   aux_shape->clear();
-  for (size_t i = 0; i < node_aux_shapes.size(); ++i) {
-    if (node_aux_shapes[i].size() > 0) {
-      for (auto const &shape : node_aux_shapes[i]) {
+  std::vector<uint32_t> head_nodes;
+  for (const auto& head : heads) {
+    head_nodes.push_back(head.source_id);
+  }
+  std::vector<uint32_t> fwd_nodes = PostDFSOrder(head_nodes, std::unordered_set<uint32_t>());
+  uint32_t counter = 0;
+  for (uint32_t nid : fwd_nodes) {
+    // backward consistentcy check.
+    CHECK(nid == counter++);
+    if (node_aux_shapes[nid].size() > 0) {
+      for (auto const &shape : node_aux_shapes[nid]) {
         aux_shape->push_back(shape);
       }
     }
@@ -189,12 +224,61 @@ StaticGraph::Node StaticGraph::CreateSumNode(
   return agg_node;
 }
 
+StaticGraph::Node StaticGraph::CreateCopyNode(const DataEntry &source) {
+  // find multiple gradients, need aggregate
+  Node copy_node;
+  copy_node.op.reset(OperatorProperty::Create("_CrossDeviceCopy"));
+  copy_node.inputs = {source};
+  return copy_node;
+}
+
 void StaticGraph::MakeBackwardPass(std::vector<uint32_t> *head_grad_nodes,
-                                   std::vector<DataEntry> *arg_grads) {
-  arg_grads->clear();
-  head_grad_nodes->clear();
+                                   std::vector<DataEntry>* arg_grads,
+                                   std::map<uint32_t, uint32_t>* out_mirror_map) {
   // get topo order of nodes, before new nodes are added
   std::vector<uint32_t> topo_order = TopoSort();
+
+  // build a mirror map, experimental
+  std::map<uint32_t, uint32_t>& mirror_map = *out_mirror_map;
+  mirror_map.clear();
+  int do_mirror = dmlc::GetEnv("MXNET_BACKWARD_DO_MIRROR", 0);
+  int mirror_step = dmlc::GetEnv("MXNET_BACKWARD_MIRROR_STEP", 100);
+  int counter = 0;
+  int *pcounter = &counter;
+
+  auto need_mirror = [this, do_mirror, pcounter, mirror_step](uint32_t nid) {
+    if (do_mirror == 0) return false;
+    if (!nodes[nid].is_forward()) return false;
+    std::string type = nodes[nid].op->TypeString();
+    if (type == "Convolution") return false;
+    if (type == "FullyConnected") return false;
+    if (type == "Dropout") return false;
+    if (type == "Concat") return false;
+    if (type == "SoftmaxOutput") return false;
+    if (type == "CuDNNBatchNorm") return false;
+    ++pcounter[0];
+    if (pcounter[0] % mirror_step == 0) return false;
+    return true;
+  };
+
+  for (uint32_t nid : topo_order) {
+    if (need_mirror(nid)) {
+      uint32_t dup_node_id = static_cast<uint32_t>(nodes.size());
+      Node node(nodes[nid]);
+      node.name += "_mirror";
+      for (DataEntry& e : node.inputs) {
+        e.source_id = mirror_map.at(e.source_id);
+      }
+      nodes.push_back(std::move(node));
+      mirror_map[nid] = dup_node_id;
+    } else {
+      mirror_map[nid] = nid;
+    }
+  }
+
+  // normal gradient
+  arg_grads->clear();
+  head_grad_nodes->clear();
   // map out_data entry to out_grad
   std::map<DataEntry, std::vector<DataEntry> > grad_map;
   // allocate head gradient nodes
@@ -221,6 +305,7 @@ void StaticGraph::MakeBackwardPass(std::vector<uint32_t> *head_grad_nodes,
   // do backward pass traverse
   for (auto it = topo_order.rbegin(); it != topo_order.rend(); ++it) {
     uint32_t nid = *it;
+    uint32_t mirror_nid = mirror_map[nid];
     // skip variables
     if (nodes[nid].is_variable()) continue;
     CHECK(nodes[nid].is_forward()) << "Do not support Backward of Backward";
@@ -232,11 +317,12 @@ void StaticGraph::MakeBackwardPass(std::vector<uint32_t> *head_grad_nodes,
     int ntotal = nodes[nid].op->NumOutputs();
     // check all outpus
     for (int i = 0; i < ntotal; ++i) {
-      DataEntry odata(nid, static_cast<uint32_t>(i));
+      DataEntry odata(mirror_nid, static_cast<uint32_t>(i));
+      DataEntry okey(nid, static_cast<uint32_t>(i));
       out_data.push_back(odata);
       if (i >= nvisible) continue;
       // get out_grad
-      auto it = grad_map.find(odata);
+      auto it = grad_map.find(okey);
       CHECK(it != grad_map.end()) << "bad graph";
       std::vector<DataEntry> &gnodes = it->second;
       if (gnodes.size() == 1) {
@@ -254,11 +340,17 @@ void StaticGraph::MakeBackwardPass(std::vector<uint32_t> *head_grad_nodes,
     // Create a gradient backward node
     Node grad_node;
     // Point to the corresponding source
-    grad_node.backward_source_id = nid;
+    grad_node.backward_source_id = mirror_nid;
+
+    std::vector<DataEntry> source_inputs;
+    for (const DataEntry& e : nodes[nid].inputs) {
+      source_inputs.push_back(DataEntry(mirror_map[e.source_id], e.index));
+    }
     // select out the dependent inputs
-    grad_node.inputs = nodes[nid].op->BackwardInputs(
-        out_grad, nodes[nid].inputs, out_data);
-    grad_node.name = nodes[nid].name + "_backward";
+    grad_node.inputs = nodes[mirror_nid].op->BackwardInputs(
+        out_grad, source_inputs, out_data);
+
+    grad_node.name = nodes[mirror_nid].name + "_backward";
     uint32_t grad_node_id = static_cast<uint32_t>(nodes.size());
     nodes.push_back(std::move(grad_node));
     // update gradient map
@@ -308,10 +400,12 @@ void StaticGraph::Node::Save(dmlc::JSONWriter *writer) const {
   writer->WriteObjectKeyValue("name", name);
   writer->WriteObjectKeyValue("inputs", inputs);
   writer->WriteObjectKeyValue("backward_source_id", backward_source_id);
+  if (attr.size() != 0) writer->WriteObjectKeyValue("attr", attr);
   writer->EndObject();
 }
 
 void StaticGraph::Node::Load(dmlc::JSONReader *reader) {
+  attr.clear();
   dmlc::JSONObjectReadHelper helper;
   std::string op_type_str;
   std::map<std::string, std::string> param;
@@ -320,6 +414,7 @@ void StaticGraph::Node::Load(dmlc::JSONReader *reader) {
   helper.DeclareField("name", &name);
   helper.DeclareField("inputs", &inputs);
   helper.DeclareField("backward_source_id", &backward_source_id);
+  helper.DeclareOptionalField("attr", &attr);
   helper.ReadAllFields(reader);
 
   if (op_type_str != "null") {

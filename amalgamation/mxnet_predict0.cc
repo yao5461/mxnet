@@ -9,6 +9,10 @@
 #define MSHADOW_RABIT_PS 	0
 #define MSHADOW_DIST_PS 	0
 
+#if defined(__ANDROID__) || defined(__MXNET_JS__)
+#define MSHADOW_USE_SSE         0
+#endif
+
 #define MXNET_USE_OPENCV 	0
 #define MXNET_PREDICT_ONLY 	1
 #define DISABLE_OPENMP 1

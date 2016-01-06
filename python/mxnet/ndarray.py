@@ -45,6 +45,13 @@ def _new_alloc_handle(shape, ctx, delay_alloc):
         ctypes.byref(hdl)))
     return hdl
 
+def waitall():
+    """Wait all async operation to finish in MXNet
+
+    This function is used for benchmark only
+    """
+    check_call(_LIB.MXNDArrayWaitAll())
+
 class NDArray(object):
     """NDArray object in mxnet.
 
@@ -274,6 +281,16 @@ class NDArray(object):
         check_call(_LIB.MXNDArrayGetShape(
             self.handle, ctypes.byref(ndim), ctypes.byref(pdata)))
         return tuple(pdata[:ndim.value])
+
+    @property
+    def size(self):
+        """Get size of current NDArray.
+
+        Returns
+        -------
+        an int representing size of current ndarray
+        """
+        return np.prod(self.shape)
 
     @property
     def context(self):
@@ -551,7 +568,6 @@ def _make_ndarray_function(handle):
     NDARRAY_ARG_BEFORE_SCALAR = 1
     ACCEPT_EMPTY_MUTATE_TARGET = 1 << 2
     # Get the property of NDArray
-    n_mutate_vars = 0
     n_used_vars = mx_uint()
     n_scalars = mx_uint()
     n_mutate_vars = mx_uint()
