@@ -74,6 +74,29 @@ class ActivationOp : public Operator {
     CHECK(in_data.size() == 1 && in_grad.size() == 1);
     CHECK_EQ(req.size(), 1);
     Stream<xpu> *s = ctx.get_stream<xpu>();
+    
+#if 0
+    Tensor<xpu, 4> grad = out_grad[activation::kOut].get<xpu, 4, real_t>(s);
+    TShape gshape = out_grad[activation::kOut].shape_;
+    if (0 || gshape[1] == 4 && gshape[2] == 43) {
+    std::cout << "active_out_grad => " << gshape[0] << ", " << gshape[1] << ", " << gshape[2] << ", " << gshape[3] << " ==> \n";
+    Tensor<xpu, 3> gradone = grad[0];
+//    for (index_t ddi = 0; ddi < gshape[1]; ddi++) {
+    for (index_t ddi = 0; ddi < 1; ddi++) {
+    std::cout << "ddi:" << ddi << "--->";
+    for (index_t ri = 0; ri < gshape[2]; ri++) {
+      for (index_t ci = 0; ci < gshape[3]; ci++) {
+        real_t tmpval = gradone[ddi][ri][ci];
+        if (fabs(tmpval) > 0.f) {
+          std::cout << tmpval << ", ";
+        }
+      }
+    }
+    std::cout << "\n";
+    }
+    }
+#endif
+
     Tensor<xpu, 2> m_out_grad = out_grad[activation::kOut].FlatTo2D<xpu, real_t>(s);
     Tensor<xpu, 2> m_out_data = out_data[activation::kOut].FlatTo2D<xpu, real_t>(s);
     Tensor<xpu, 2> m_in_grad = in_grad[activation::kData].FlatTo2D<xpu, real_t>(s);

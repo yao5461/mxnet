@@ -67,11 +67,13 @@ class AnchorClsCostOp : public Operator {
     Tensor<xpu, 2> tmarklabel = marklabel.FlatTo2D<xpu, real_t>(s);
     Tensor<xpu, 2> tdata_out = data_out.FlatTo2D<xpu, real_t>(s);
     
-//    std::cout << "class:" << tdata_in[0][0] << "\n";
+//    std::cout << "class:" << tmarklabel[0][0] << "\n";
 
     tdata_out = F<mshadow_op::log>(tdata_in + MIN_NUM) * tlabel +
                 (1.0f - tlabel) * F<mshadow_op::log>(1.0f - tdata_in + MIN_NUM);
-    tdata_out = tdata_out * tmarklabel * -1;
+    tdata_out = F<mshadow_op::negation>(tdata_out * tmarklabel);
+    
+//    tdata_out = 10.f;
   }
 
   virtual void Backward(const OpContext &ctx,
@@ -97,7 +99,7 @@ class AnchorClsCostOp : public Operator {
     
     tgrad_in = tlabel / (tdata_in + MIN_NUM) - \
               (1.0f - tlabel) / (1.0f - tdata_in + MIN_NUM);
-    tgrad_in = tgrad_in * tmarklabel * -1;
+    tgrad_in = F<mshadow_op::negation>(tgrad_in * tmarklabel);
   }
 
   AnchorClsCostParam param_;

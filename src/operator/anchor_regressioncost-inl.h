@@ -76,31 +76,33 @@ class AnchorRegCostOp : public Operator {
     Tensor<xpu, 4> tinfolabel = infolabel.get<xpu, 4, real_t>(s);
     Tensor<xpu, 4> tdata_out = data_out.get<xpu, 4, real_t>(s);
 
+#if 1
     for (index_t bi = 0; bi < shape_in[0]; bi++) {
-      const Tensor<xpu, 3> &onebb = tbbslabel[bi];
-      const Tensor<xpu, 3> &coords = tcoordlabel[bi];
+      Tensor<xpu, 3> onebb = tbbslabel[bi];
+      Tensor<xpu, 3> coords = tcoordlabel[bi];
       for (index_t ai = 0; ai < anchornum; ai++) {
-        const Tensor<xpu, 2> &onelabel = tlabel[bi][ai];
-        const Tensor<xpu, 3> &onedatas = tdata_in[bi].Slice(ai * 4, (ai + 1) * 4);
-        const Tensor<xpu, 3> &oneouts = tdata_out[bi].Slice(ai * 4, (ai + 1) * 4);
-        const Tensor<xpu, 3> &oneinfo = tinfolabel[ai];
+        Tensor<xpu, 2> onelabel = tlabel[bi][ai];
+        Tensor<xpu, 3> onedatas = tdata_in[bi].Slice(ai * 4, (ai + 1) * 4);
+        Tensor<xpu, 3> oneouts = tdata_out[bi].Slice(ai * 4, (ai + 1) * 4);
+        Tensor<xpu, 3> oneinfo = tinfolabel[ai];
+
         for (index_t di = 0; di < 2; di++) {
-          const Tensor<xpu, 2> &onedata = onedatas[di];
-          const Tensor<xpu, 2> &onecoord = coords[di];
-      //    oneouts[di] = F<mshadow::op::minus>(onedata, ScalarExp<real_t>(onebb[di]));
-          oneouts[di] = F<mshadow_op::square>(onedata -
-                       ((onebb[di] - onecoord) / oneinfo[di])) * onelabel / 2;
+          Tensor<xpu, 2> onedata = onedatas[di];
+          Tensor<xpu, 2> onecoord = coords[di];
+          oneouts[di] = F<mshadow_op::smooth_l1>(onedata -
+                       ((onebb[di] - onecoord) / oneinfo[di])) * onelabel;
+       //   printf("yx %f, %f\n", onebb[di][45/2][70/2], oneinfo[di][45/2][70/2]);
         }
-        const Tensor<xpu, 3> &onedata2 = onedatas.Slice(2, 4);
-        const Tensor<xpu, 3> &partbb = onebb.Slice(2, 4);
+        Tensor<xpu, 3> onedata2 = onedatas.Slice(2, 4);
+        Tensor<xpu, 3> partbb = onebb.Slice(2, 4);
         for (index_t di = 0; di < 2; di++) {
-       //   real_t t_star = logf(partbb[di] / oneinfo[di] + MIN_NUM);
-          oneouts[di] = F<mshadow_op::square>(onedata2[di] -
-                        (F<mshadow_op::log>(partbb[di] / oneinfo[di] + MIN_NUM))) * onelabel / 2;
+          oneouts[di + 2] = F<mshadow_op::smooth_l1>(onedata2[di] -
+                        (F<mshadow_op::log>(partbb[di] / oneinfo[di] + MIN_NUM))) * onelabel;
+       //   printf("hw %f, %f\n", partbb[di][45/2][70/2], oneinfo[di][45/2][70/2]);
         }
       }
     }
-    
+#endif    
   }
 
   virtual void Backward(const OpContext &ctx,
@@ -113,7 +115,7 @@ class AnchorRegCostOp : public Operator {
     using namespace mshadow;
     using namespace mshadow::expr;
     Stream<xpu> *s = ctx.get_stream<xpu>();
-    
+
     index_t anchornum = param_.anchornum;
 
     TBlob data_in = in_data[anchor_regcost_enum::kData];
@@ -122,38 +124,65 @@ class AnchorRegCostOp : public Operator {
     TBlob bbslabel = in_data[anchor_regcost_enum::kBBsLabel];
     TBlob infolabel = in_data[anchor_regcost_enum::kAnchorInfoLabel];
     TBlob grad_in = in_grad[anchor_regcost_enum::kOut];
-    
+
     TShape shape_in = data_in.shape_;
-    
+
     Tensor<xpu, 4> tdata_in = data_in.get<xpu, 4, real_t>(s);
     Tensor<xpu, 4> tlabel = label.get<xpu, 4, real_t>(s);
     Tensor<xpu, 4> tcoordlabel = coordlabel.get<xpu, 4, real_t>(s);
     Tensor<xpu, 4> tbbslabel = bbslabel.get<xpu, 4, real_t>(s);
     Tensor<xpu, 4> tinfolabel = infolabel.get<xpu, 4, real_t>(s);
     Tensor<xpu, 4> tgrad_in = grad_in.get<xpu, 4, real_t>(s);
-    
+#if 1
+//#define DIM1 21
+//#define DIM2 32
     for (index_t bi = 0; bi < shape_in[0]; bi++) {
-      const Tensor<xpu, 3> &onebb = tbbslabel[bi];
-      const Tensor<xpu, 3> &coords = tcoordlabel[bi];
+      Tensor<xpu, 3> onebb = tbbslabel[bi];
+      Tensor<xpu, 3> coords = tcoordlabel[bi];
       for (index_t ai = 0; ai < anchornum; ai++) {
-        const Tensor<xpu, 2> &onelabel = tlabel[bi][ai];
-        const Tensor<xpu, 3> &onedatas = tdata_in[bi].Slice(ai * 4, (ai + 1) * 4);
-        const Tensor<xpu, 3> &onegrads = tgrad_in[bi].Slice(ai * 4, (ai + 1) * 4);
-        const Tensor<xpu, 3> &oneinfo = tinfolabel[ai];
+        Tensor<xpu, 2> onelabel = tlabel[bi][ai];
+        Tensor<xpu, 3> onedatas = tdata_in[bi].Slice(ai * 4, (ai + 1) * 4);
+        Tensor<xpu, 3> onegrads = tgrad_in[bi].Slice(ai * 4, (ai + 1) * 4);
+        Tensor<xpu, 3> oneinfo = tinfolabel[ai];
         for (index_t di = 0; di < 2; di++) {
-          const Tensor<xpu, 2> &onedata = onedatas[di];
-          const Tensor<xpu, 2> &onecoord = coords[di];
-          onegrads[di] = (onedata - ((onebb[di] - onecoord) / oneinfo[di])) * onelabel;
+          Tensor<xpu, 2> onedata = onedatas[di];
+          Tensor<xpu, 2> onecoord = coords[di];
+          onegrads[di] = F<mshadow_op::smooth_l1_grad>(onedata -
+                       ((onebb[di] - onecoord) / oneinfo[di])) * onelabel;
+//          printf("yx g:%f, o:%f, yx:%f, ayx:%f, ahw:%f, l:%f\n", onegrads[di][DIM1][DIM2], onedata[DIM1][DIM2], onebb[di][DIM1][DIM2], onecoord[DIM1][DIM2], oneinfo[di][DIM1][DIM2], onelabel[DIM1][DIM2]);
         }
-        const Tensor<xpu, 3> &onedata2 = onedatas.Slice(2, 4);
-        const Tensor<xpu, 3> &partbb = onebb.Slice(2, 4);
+        Tensor<xpu, 3> onedata2 = onedatas.Slice(2, 4);
+        Tensor<xpu, 3> partbb = onebb.Slice(2, 4);
         for (index_t di = 0; di < 2; di++) {
-          onegrads[di] = (onedata2[di] -
-            F<mshadow_op::log>(partbb[di] / oneinfo[di] + MIN_NUM)) * onelabel;
+          onegrads[di + 2] = F<mshadow_op::smooth_l1_grad>(onedata2[di] -
+                        (F<mshadow_op::log>(partbb[di] / oneinfo[di] + MIN_NUM))) * onelabel;
+//          printf("hw g:%f, o:%f, hw:%f, ahw:%f, l:%f\n", onegrads[di + 2][DIM1][DIM2], onedata2[di][DIM1][DIM2], partbb[di][DIM1][DIM2], oneinfo[di][DIM1][DIM2], onelabel[DIM1][DIM2]);
         }
       }
     }
-    
+#endif
+#if 0
+    tgrad_in = tdata_out + 600.0f;
+    TShape gshape = in_grad[anchor_regcost_enum::kOut].shape_;
+    if (gshape[1] == 4 && gshape[2] == 43) {
+    std::cout << "in_grad => " << gshape[0] << ", " << gshape[1] << ", " << gshape[2] << ", " << gshape[3] << " ==> \n";
+    Tensor<xpu, 3> gradone = tgrad_in[0];
+    for (index_t ddi = 0; ddi < gshape[1]; ddi++) {
+    std::cout << "ddi:" << ddi << "--->";
+    for (index_t ri = 0; ri < gshape[2]; ri++) {
+      for (index_t ci = 0; ci < gshape[3]; ci++) {
+        real_t tmpval = gradone[ddi][ri][ci];
+        if (1 || fabs(tmpval) > 0.f) {
+          std::cout << tmpval << ", ";
+        }
+      }
+    }
+    std::cout << "\n";
+    }
+    }
+#endif
+
+
   }
 
   AnchorRegCostParam param_;
@@ -216,7 +245,7 @@ class AnchorRegCostProp : public OperatorProperty {
     const std::vector<int> &out_grad,
     const std::vector<int> &in_data,
     const std::vector<int> &out_data) const override {
-    return {out_data[anchor_regcost_enum::kOut],
+    return {//out_data[anchor_regcost_enum::kOut],
             in_data[anchor_regcost_enum::kData],
             in_data[anchor_regcost_enum::kLabel],
             in_data[anchor_regcost_enum::kCoordLabel],

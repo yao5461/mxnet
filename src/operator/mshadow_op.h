@@ -2,7 +2,7 @@
  * Copyright (c) 2015 by Contributors
  * \file mshadow_op.h
  * \brief
- * \author Bing Xu
+ * \author Bing Xu, Ming Zhang
 */
 #ifndef MXNET_OPERATOR_MSHADOW_OP_H_
 #define MXNET_OPERATOR_MSHADOW_OP_H_
@@ -134,6 +134,36 @@ struct square_root {
 struct square_root_grad {
   MSHADOW_XINLINE static real_t Map(real_t a) {
     return 0.5f / a;
+  }
+};
+
+
+/*!\ \brief used for generate element smooth l1 */
+struct smooth_l1 {
+  MSHADOW_XINLINE static real_t Map(real_t a) {
+    real_t ret = 0.0f;
+    real_t abs_a = fabs(a);
+    if (abs_a < 1.0f) {
+      ret = 0.5f * a * a;
+    }
+    else {
+      ret = abs_a - 0.5f;
+    }
+    return ret;
+  }
+};
+
+struct smooth_l1_grad {
+  MSHADOW_XINLINE static real_t Map(real_t a) {
+    real_t ret = 0.0f;
+    real_t abs_a = fabs(a);
+    if (abs_a < 1.0f) {
+      ret = a;
+    }
+    else {
+      ret = a < 0.f ? -1.5f : 0.5f;
+    }
+    return ret;
   }
 };
 

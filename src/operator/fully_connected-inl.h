@@ -98,6 +98,16 @@ class FullyConnectedOp : public Operator {
     Tensor<xpu, 2> data = in_data[fullc::kData].FlatTo2D<xpu, real_t>(s);
     Tensor<xpu, 2> wmat = in_data[fullc::kWeight].get<xpu, 2, real_t>(s);
     Tensor<xpu, 2> grad = out_grad[fullc::kOut].FlatTo2D<xpu, real_t>(s);
+#if 0
+    Shape<2> gshape = grad.shape_;
+    if (gshape[1] == 10) {
+      std::cout << "full connect:" << gshape[0] << ", " << gshape[1] << "\n";
+      for (index_t i = 0; i < gshape[1]; i++) {
+        std::cout << grad[0][i] << ", ";
+      }
+      std::cout << "\n";
+    }
+#endif
 #if defined(__CUDACC__)
     CHECK_EQ(s->blas_handle_ownership_, Stream<xpu>::OwnHandle)
         << "Must init CuBLAS handle in stream";

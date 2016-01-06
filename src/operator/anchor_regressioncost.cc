@@ -25,7 +25,7 @@ DMLC_REGISTER_PARAMETER(AnchorRegCostParam);
 MXNET_REGISTER_OP_PROPERTY(AnchorRegCost, AnchorRegCostProp)
 .add_argument("data", "Symbol", "Input data to the AnchorRegCostOp.")
 .add_argument("label", "Symbol", "Label data to the AnchorRegCostOp.")
-.add_argument("coordlabel", "Symbol", "Label data to the AnchorRegCostOp.")
+.add_argument("coordlabel", "Symbol", "CoordLabel data to the AnchorRegCostOp.")
 .add_argument("bbslabel", "Symbol", "BBsLabel data to the AnchorRegCostOp.")
 .add_argument("infolabel", "Symbol", "AnchorInfoLabel data to the AnchorRegCostOp.")
 .add_arguments(AnchorRegCostParam::__FIELDS__())

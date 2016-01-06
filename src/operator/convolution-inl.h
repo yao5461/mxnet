@@ -157,6 +157,26 @@ class ConvolutionOp : public Operator {
                data.shape_[1] / param_.num_group * param_.kernel[0] * param_.kernel[1]);
     Tensor<xpu, 3> wmat = in_data[conv::kWeight].get_with_shape<xpu, 3, real_t>(wmat_shape, s);
     Tensor<xpu, 4> grad = out_grad[conv::kOut].get<xpu, 4, real_t>(s);
+#if 0
+    TShape gshape = out_grad[conv::kOut].shape_;
+    if (0 || gshape[1] == 1 && gshape[2] == 43) {
+    std::cout << "out_grad => " << gshape[0] << ", " << gshape[1] << ", " << gshape[2] << ", " << gshape[3] << " ==> \n";
+    Tensor<xpu, 3> gradone = grad[0];
+//    for (index_t ddi = 0; ddi < gshape[1]; ddi++) {
+    for (index_t ddi = 0; ddi < 1; ddi++) {
+    std::cout << "ddi:" << ddi << "--->";
+    for (index_t ri = 0; ri < gshape[2]; ri++) {
+      for (index_t ci = 0; ci < gshape[3]; ci++) {
+        real_t tmpval = gradone[ddi][ri][ci];
+        if (1 || fabs(tmpval) > 0.f) {
+          std::cout << tmpval << ", ";
+        }
+      }
+    }
+    std::cout << "\n";
+    }
+    }
+#endif
     Tensor<xpu, 4> gdata = in_grad[conv::kData].get<xpu, 4, real_t>(s);
     Tensor<xpu, 3> gwmat = in_grad[conv::kWeight].get_with_shape<xpu, 3, real_t>(wmat_shape, s);
 #if defined(__CUDACC__)
